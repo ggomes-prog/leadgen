@@ -16,8 +16,10 @@ const PORT = process.env.PORT || 3000;
  * CNPJ.biz (depende da sua conta):
  * - CNPJBIZ_BASE_URL        (com https)
  * - CNPJBIZ_API_KEY
- * - CNPJBIZ_PATH_TEMPLATE   (ex: /cnpj/{cnpj}  ou /v1/cnpj/{cnpj})
- * - CNPJBIZ_AUTH_HEADER     (ex: Authorization  ou x-api-key)
+ *
+ * (opcional, se sua API do CNPJ.biz não for o padrão)
+ * - CNPJBIZ_PATH_TEMPLATE   (ex: /cnpj/{cnpj} ou /v1/cnpj/{cnpj})
+ * - CNPJBIZ_AUTH_HEADER     (ex: Authorization ou x-api-key)
  * - CNPJBIZ_AUTH_PREFIX     (ex: Bearer | Token | vazio)
  *
  * Opcionais:
@@ -25,10 +27,10 @@ const PORT = process.env.PORT || 3000;
  * - MAX_EXTRA_LINKS         (ex: 12)
  */
 
-// ====== AUTH: Authorization: Bearer <ACTION_API_KEY> ======
+// ===================== AUTH =====================
 function checkAuth(req, res, next) {
   const expected = process.env.ACTION_API_KEY;
-  if (!expected) return next(); // (debug) Em produção deixe configurado.
+  if (!expected) return next(); // debug: em produção, mantenha configurado
 
   const auth = req.headers.authorization || "";
   if (auth !== `Bearer ${expected}`) {
@@ -37,7 +39,7 @@ function checkAuth(req, res, next) {
   next();
 }
 
-// ===== Helpers =====
+// ===================== HELPERS =====================
 function normalizeDomain(input) {
   return (input || "")
     .trim()
@@ -60,61 +62,137 @@ function stripTags(html) {
     .replace(/\s+/g, " ");
 }
 
+function formatCNPJ(cnpjDigits) {
+  const d = (cnpjDigits || "").replace(/\D/g, "");
+  if (d.length !== 14) return null;
+  return `${d.slice(0, 2)}.${d.slice(2, 5)}.${d.slice(5, 8)}/${d.slice(
+    8,
+    12
+  )}-${d.slice(12)}`;
+}
+
 function extractEmails(text) {
   const matches = text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi) || [];
   return uniq(matches.map((x) => x.toLowerCase()));
 }
 
+// -------- Telefones (melhorado) + WhatsApp como contato --------
 function extractPhones(text) {
-  // Telefones BR comuns e formatos variados
-  const m1 =
-    text.match(/(\+?55\s?)?(\(?\d{2}\)?\s?)?\d{4,5}[-\s.]?\d{4}/g) || [];
-  const telLinks = text.match(/tel:\+?[0-9()+\-\s.]{8,}/gi) || [];
-  const m2 = telLinks.map((t) => t.replace(/^tel:/i, "").trim());
+  const t = (text || "").replace(/\s+/g, " ");
 
-  const raw = uniq([...m1, ...m2].map((x) => x.trim()));
+  // 1) tel: links
+  const telLinks = t.match(/tel:\+?[0-9()+\-\s.]{8,}/gi) || [];
+  const fromTel = telLinks.map((x) => x.replace(/^tel:/i, "").trim());
 
-  // Normalização leve (não é perfeita, mas melhora)
+  // 2) WhatsApp links (também conta como telefone de contato)
+  const wa = [];
+  const m1 = t.match(/wa\.me\/\d{8,15}/gi) || [];
+  for (const x of m1) wa.push("+" + x.split("/")[1]);
+
+  const m2 = t.match(/api\.whatsapp\.com\/send\?phone=\d{8,15}/gi) || [];
+  for (const x of m2) wa.push("+" + x.split("phone=")[1]);
+
+  // 3) números “escritos” (flexível)
+  const normalMatches =
+    t.match(/(\+?55\s?)?(\(?\d{2}\)?\s?)?\d{4,5}[\s.\-]?\d{4}/g) || [];
+
+  // 4) 0800
+  const tollFree = t.match(/\b0800[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g) || [];
+
+  const raw = uniq([...fromTel, ...wa, ...normalMatches, ...tollFree].map((x) => x.trim()));
+
+  // normalização simples
   const normalized = raw
     .map((s) => s.replace(/[^\d+]/g, ""))
     .map((s) => {
-      // se for só dígitos e começar com DDD, coloca +55
       const digits = s.replace(/\D/g, "");
+      if (digits.startsWith("0800")) return digits; // mantém 0800
       if (digits.length === 10 || digits.length === 11) return `+55${digits}`;
       if (digits.length === 12 || digits.length === 13) return `+${digits}`;
-      return s;
+      if (s.startsWith("+")) return s;
+      return digits.length >= 8 ? digits : null;
     })
-    .filter((s) => s && s.length >= 8);
+    .filter(Boolean);
 
   return uniq(normalized);
 }
 
-function extractWhatsApps(text) {
-  // Captura WhatsApp via wa.me ou api.whatsapp.com
-  const wa = [];
-
-  const m1 = text.match(/wa\.me\/\d{8,15}/gi) || [];
-  for (const x of m1) {
-    const num = x.split("/")[1];
-    if (num) wa.push(`+${num}`);
-  }
-
-  const m2 =
-    text.match(/api\.whatsapp\.com\/send\?phone=\d{8,15}/gi) || [];
-  for (const x of m2) {
-    const parts = x.split("phone=");
-    const num = parts[1];
-    if (num) wa.push(`+${num}`);
-  }
-
-  return uniq(wa);
+// -------- CNPJ: pega TODOS e escolhe o mais provável (rodapé/termos/privacidade) --------
+function extractCNPJs(text) {
+  const m = text.match(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g) || [];
+  const digits = m
+    .map((x) => x.replace(/\D/g, ""))
+    .filter((x) => x.length === 14);
+  return uniq(digits);
 }
 
-function extractCNPJ(text) {
-  const m = text.match(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g);
-  if (!m || !m.length) return null;
-  const digits = m[0].replace(/\D/g, "");
-  return digits.length === 14 ? digits : null;
+function chooseBestCNPJ(htmlCombined, cnpjList) {
+  if (!cnpjList || cnpjList.length === 0) return null;
+  if (cnpjList.length === 1) return cnpjList[0];
+
+  const html = (htmlCombined || "").toLowerCase();
+
+  function score(cnpjDigits) {
+    const formatted = formatCNPJ(cnpjDigits);
+    const variants = uniq([cnpjDigits, formatted].filter(Boolean)).map((v) => v.toLowerCase());
+
+    let s = 0;
+
+    // Palavras que indicam CNPJ de empresa (mais provável ser o "certo")
+    const keywords = [
+      "cnpj",
+      "razão social",
+      "razao social",
+      "inscrição",
+      "inscricao",
+      "empresa",
+      "ltda",
+      "me",
+      "eireli",
+      "comércio",
+      "comercio",
+      "endereço",
+      "endereco",
+      "contato",
+      "institucional",
+      "termos",
+      "privacidade",
+      "reembolso",
+      "trocas",
+      "devol",
+      "footer",
+      "rodap", // pega "rodapé" mesmo sem acento
+    ];
+
+    for (const v of variants) {
+      let idx = html.indexOf(v);
+      // se o site esconde pontuação, tenta achar só dígitos também
+      if (idx < 0 && v.includes(".") && v.includes("/")) {
+        const vd = v.replace(/\D/g, "");
+        idx = html.indexOf(vd);
+      }
+      if (idx >= 0) {
+        const start = Math.max(0, idx - 200);
+        const end = Math.min(html.length, idx + 200);
+        const window = html.slice(start, end);
+
+        for (const k of keywords) {
+          if (window.includes(k)) s += 5;
+        }
+
+        // bônus se estiver perto de "shopify"/"bagy"/etc no footer? (não essencial)
+        if (window.includes("footer")) s += 3;
+      }
+    }
+
+    return s;
+  }
+
+  const ranked = cnpjList
+    .map((c) => ({ c, s: score(c) }))
+    .sort((a, b) => b.s - a.s);
+
+  return ranked[0].c;
 }
 
 function safeUrlJoin(base, path) {
@@ -126,7 +204,6 @@ function safeUrlJoin(base, path) {
 }
 
 function pickInternalLinks(baseUrl, html) {
-  // pega links internos que pareçam úteis (termos/privacidade/contato/reembolso/trocas/entrega)
   const maxExtra = Number(process.env.MAX_EXTRA_LINKS || "12");
   const links = [];
   const re = /href\s*=\s*["']([^"']+)["']/gi;
@@ -183,7 +260,6 @@ async function safeFetchText(url, timeoutMs = 12000) {
       redirect: "follow",
       signal: ctrl.signal,
       headers: {
-        // “parecer navegador” para evitar páginas reduzidas/bloqueadas
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
         Accept:
@@ -195,7 +271,7 @@ async function safeFetchText(url, timeoutMs = 12000) {
     if (!r.ok) return null;
 
     const text = await r.text();
-    if (!text || text.length < 400) return null; // muito curto = provável bloqueio/placeholder
+    if (!text || text.length < 400) return null;
     return text;
   } catch {
     return null;
@@ -204,11 +280,10 @@ async function safeFetchText(url, timeoutMs = 12000) {
   }
 }
 
-// ===== Crawl do site (robusto) =====
+// ===================== CRAWL SITE =====================
 async function crawlSite(domain) {
   const timeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || "12000");
 
-  // tenta https/http com e sem www
   const candidates = [
     `https://${domain}`,
     `https://www.${domain}`,
@@ -240,7 +315,6 @@ async function crawlSite(domain) {
 
   if (homeHtml) combined += "\n" + homeHtml;
 
-  // páginas comuns (BR + ecommerce)
   const paths = [
     "/",
     "/contato",
@@ -291,29 +365,31 @@ async function crawlSite(domain) {
     await visit(baseUrl + p);
   }
 
-  // links internos úteis encontrados na home
   if (homeHtml) {
     const extra = pickInternalLinks(baseUrl + "/", homeHtml);
     for (const u of extra) await visit(u);
   }
 
   const text = stripTags(combined);
+
   const emails = extractEmails(combined + " " + text);
   const phones = extractPhones(combined + " " + text);
-  const whatsapps = extractWhatsApps(combined + " " + text);
-  const cnpj = extractCNPJ(combined + " " + text);
+
+  // CNPJ: candidatos + escolha do melhor
+  const cnpjCandidates = extractCNPJs(combined + " " + text);
+  const cnpj = chooseBestCNPJ(combined, cnpjCandidates);
 
   return {
     baseUrl,
     crawled: combined.length > 0,
     emails,
     phones,
-    whatsapps,
     cnpj,
+    cnpjCandidates,
   };
 }
 
-// ===== BuiltWith =====
+// ===================== BUILTWITH =====================
 async function builtwithLookup(domain) {
   const key = process.env.BUILTWITH_API_KEY;
   if (!key) return { ok: false, tech: [] };
@@ -346,11 +422,10 @@ async function builtwithLookup(domain) {
   }
 }
 
-// ===== Classificação (Plataforma + Automação) =====
+// ===================== CLASSIFICAÇÃO =====================
 function classifyFromBuiltWith(techList) {
   const tech = (techList || []).map((t) => t.toLowerCase());
 
-  // Plataformas
   const platformRules = [
     { key: "bagy", name: "Bagy" },
     { key: "shopify", name: "Shopify" },
@@ -370,7 +445,6 @@ function classifyFromBuiltWith(techList) {
     { key: "sap commerce", name: "SAP Commerce Cloud" },
   ];
 
-  // Automação / CRM / Marketing
   const marketingRules = [
     { key: "klaviyo", name: "Klaviyo" },
     { key: "rd station", name: "RD Station" },
@@ -405,7 +479,7 @@ function classifyFromBuiltWith(techList) {
   };
 }
 
-// ===== CNPJ.biz (configurável por variáveis) =====
+// ===================== CNPJ.BIZ (CONFIGURÁVEL) =====================
 async function cnpjbizLookup(cnpjDigits) {
   const base = process.env.CNPJBIZ_BASE_URL;
   const key = process.env.CNPJBIZ_API_KEY;
@@ -426,7 +500,7 @@ async function cnpjbizLookup(cnpjDigits) {
     if (!r.ok) return null;
     const data = await r.json();
 
-    // Mapeamento genérico (ajuste depois conforme seu retorno real)
+    // Mapeamento genérico (ajuste se necessário, conforme retorno real da sua conta)
     const partners = data?.partners || data?.socios || data?.qsa || [];
     const phones = data?.phones || data?.telefones || [];
     const emails = data?.emails || (data?.email ? [data.email] : []);
@@ -449,7 +523,7 @@ async function cnpjbizLookup(cnpjDigits) {
   }
 }
 
-// ===== Rotas =====
+// ===================== ROTAS =====================
 app.get("/health", (req, res) => {
   res.json({ ok: true, message: "Middleware online" });
 });
@@ -475,11 +549,13 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
     ecommerce_platform: classified.ecommerce_platform,
     marketing_automation_tools: classified.marketing_automation_tools,
 
+    // Telefones (inclui WhatsApp/0800/tel: quando existir)
     phones_found_on_site: site.phones,
-    whatsapps_found_on_site: site.whatsapps,
     emails_found_on_site: site.emails,
 
-    cnpj: site.cnpj,
+    // CNPJ escolhido + candidatos (pra você auditar)
+    cnpj: site.cnpj ? formatCNPJ(site.cnpj) : null,
+    cnpj_candidates: (site.cnpjCandidates || []).map(formatCNPJ).filter(Boolean),
 
     cnpjbiz: cnpjbiz
       ? {
@@ -490,14 +566,14 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
         }
       : null,
 
-    // Debug (útil pra você entender quando algo não aparece)
+    // Debug
     builtwith_technologies: bw.tech,
     sources: { builtwith: bw.ok, site: site.crawled, cnpjbiz: !!cnpjbiz },
     notes: [
       site.crawled
         ? "Site visitado."
         : "Não consegui acessar o site (https/http e www falharam).",
-      site.cnpj ? "CNPJ encontrado no site." : "CNPJ não encontrado no site.",
+      site.cnpj ? "CNPJ encontrado no site (melhor candidato)." : "CNPJ não encontrado no site.",
       bw.ok ? "BuiltWith consultado." : "BuiltWith não consultado (sem chave ou falha).",
       cnpjbiz ? "CNPJ.biz consultado." : "CNPJ.biz não consultado (sem CNPJ, sem config ou falha).",
     ],
