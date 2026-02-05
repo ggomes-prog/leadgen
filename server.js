@@ -7,24 +7,28 @@ const PORT = process.env.PORT || 3000;
 
 /**
  * ===== Variáveis no Railway =====
- * Obrigatórias:
- * - ACTION_API_KEY (senha do Bearer pro Action)
+ * Obrigatórias (para o Action com Bearer):
+ * - ACTION_API_KEY
  *
- * Recomendadas:
+ * BuiltWith:
  * - BUILTWITH_API_KEY
  *
- * Para CNPJ.biz (depende da sua conta):
+ * CNPJ.biz (depende da sua conta):
+ * - CNPJBIZ_BASE_URL        (com https)
  * - CNPJBIZ_API_KEY
- * - CNPJBIZ_BASE_URL (com https)
- * - CNPJBIZ_PATH_TEMPLATE  (ex: /cnpj/{cnpj}  ou /v1/cnpj/{cnpj})
- * - CNPJBIZ_AUTH_HEADER    (ex: Authorization)
- * - CNPJBIZ_AUTH_PREFIX    (ex: Bearer)  ou deixe vazio pra usar a key pura
+ * - CNPJBIZ_PATH_TEMPLATE   (ex: /cnpj/{cnpj}  ou /v1/cnpj/{cnpj})
+ * - CNPJBIZ_AUTH_HEADER     (ex: Authorization  ou x-api-key)
+ * - CNPJBIZ_AUTH_PREFIX     (ex: Bearer | Token | vazio)
+ *
+ * Opcionais:
+ * - REQUEST_TIMEOUT_MS      (ex: 12000)
+ * - MAX_EXTRA_LINKS         (ex: 12)
  */
 
 // ====== AUTH: Authorization: Bearer <ACTION_API_KEY> ======
 function checkAuth(req, res, next) {
   const expected = process.env.ACTION_API_KEY;
-  if (!expected) return next(); // útil no começo, mas em produção deixe configurado
+  if (!expected) return next(); // (debug) Em produção deixe configurado.
 
   const auth = req.headers.authorization || "";
   if (auth !== `Bearer ${expected}`) {
@@ -47,10 +51,13 @@ function uniq(arr) {
   return Array.from(new Set((arr || []).filter(Boolean)));
 }
 
-function normalizePhone(s) {
-  return (s || "")
-    .replace(/[^\d+]/g, "")
-    .replace(/^(\d{2})(\d{8,9})$/, "+55$1$2"); // tentativa BR simples
+function stripTags(html) {
+  return (html || "")
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?>[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<\/?[^>]+>/g, " ")
+    .replace(/\s+/g, " ");
 }
 
 function extractEmails(text) {
@@ -59,14 +66,48 @@ function extractEmails(text) {
 }
 
 function extractPhones(text) {
-  // Pega padrões comuns BR + tel:
+  // Telefones BR comuns e formatos variados
   const m1 =
     text.match(/(\+?55\s?)?(\(?\d{2}\)?\s?)?\d{4,5}[-\s.]?\d{4}/g) || [];
-  const m2 = [];
   const telLinks = text.match(/tel:\+?[0-9()+\-\s.]{8,}/gi) || [];
-  for (const t of telLinks) m2.push(t.replace(/^tel:/i, ""));
+  const m2 = telLinks.map((t) => t.replace(/^tel:/i, "").trim());
+
   const raw = uniq([...m1, ...m2].map((x) => x.trim()));
-  return uniq(raw.map(normalizePhone).filter((x) => x.length >= 8));
+
+  // Normalização leve (não é perfeita, mas melhora)
+  const normalized = raw
+    .map((s) => s.replace(/[^\d+]/g, ""))
+    .map((s) => {
+      // se for só dígitos e começar com DDD, coloca +55
+      const digits = s.replace(/\D/g, "");
+      if (digits.length === 10 || digits.length === 11) return `+55${digits}`;
+      if (digits.length === 12 || digits.length === 13) return `+${digits}`;
+      return s;
+    })
+    .filter((s) => s && s.length >= 8);
+
+  return uniq(normalized);
+}
+
+function extractWhatsApps(text) {
+  // Captura WhatsApp via wa.me ou api.whatsapp.com
+  const wa = [];
+
+  const m1 = text.match(/wa\.me\/\d{8,15}/gi) || [];
+  for (const x of m1) {
+    const num = x.split("/")[1];
+    if (num) wa.push(`+${num}`);
+  }
+
+  const m2 =
+    text.match(/api\.whatsapp\.com\/send\?phone=\d{8,15}/gi) || [];
+  for (const x of m2) {
+    const parts = x.split("phone=");
+    const num = parts[1];
+    if (num) wa.push(`+${num}`);
+  }
+
+  return uniq(wa);
 }
 
 function extractCNPJ(text) {
@@ -74,15 +115,6 @@ function extractCNPJ(text) {
   if (!m || !m.length) return null;
   const digits = m[0].replace(/\D/g, "");
   return digits.length === 14 ? digits : null;
-}
-
-function stripTags(html) {
-  return (html || "")
-    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?>[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<\/?[^>]+>/g, " ")
-    .replace(/\s+/g, " ");
 }
 
 function safeUrlJoin(base, path) {
@@ -94,9 +126,11 @@ function safeUrlJoin(base, path) {
 }
 
 function pickInternalLinks(baseUrl, html) {
-  // pega links internos que pareçam úteis (termos/privacidade/contato/sobre)
+  // pega links internos que pareçam úteis (termos/privacidade/contato/reembolso/trocas/entrega)
+  const maxExtra = Number(process.env.MAX_EXTRA_LINKS || "12");
   const links = [];
   const re = /href\s*=\s*["']([^"']+)["']/gi;
+
   let m;
   while ((m = re.exec(html || ""))) {
     const href = m[1];
@@ -105,13 +139,15 @@ function pickInternalLinks(baseUrl, html) {
 
     const abs = safeUrlJoin(baseUrl, href);
     if (!abs) continue;
+
     try {
       const u = new URL(abs);
       const b = new URL(baseUrl);
       if (u.hostname !== b.hostname) continue;
 
-      const p = u.pathname.toLowerCase();
-      if (
+      const p = (u.pathname || "").toLowerCase();
+
+      const looksUseful =
         p.includes("termo") ||
         p.includes("priv") ||
         p.includes("contato") ||
@@ -120,29 +156,47 @@ function pickInternalLinks(baseUrl, html) {
         p.includes("quem-somos") ||
         p.includes("institucional") ||
         p.includes("atendimento") ||
-        p.includes("politica")
-      ) {
-        links.push(abs);
-      }
+        p.includes("politica") ||
+        p.includes("reembolso") ||
+        p.includes("devol") ||
+        p.includes("troca") ||
+        p.includes("entrega") ||
+        p.includes("frete") ||
+        p.includes("envio") ||
+        p.includes("shipping") ||
+        p.includes("refund") ||
+        p.includes("returns");
+
+      if (looksUseful) links.push(abs);
     } catch {}
   }
-  return uniq(links).slice(0, 12); // limite
+
+  return uniq(links).slice(0, maxExtra);
 }
 
-async function safeFetchText(url, timeoutMs = 10000) {
+async function safeFetchText(url, timeoutMs = 12000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+
   try {
-    const r = await fetch(url, { redirect: "follow", signal: ctrl.signal });
+    const r = await fetch(url, {
+      redirect: "follow",
+      signal: ctrl.signal,
+      headers: {
+        // “parecer navegador” para evitar páginas reduzidas/bloqueadas
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+      },
+    });
+
     if (!r.ok) return null;
 
-    const ct = (r.headers.get("content-type") || "").toLowerCase();
-    // alguns sites devolvem html sem content-type perfeito, mas isso cobre a maioria
-    if (ct && !ct.includes("text/html") && !ct.includes("application/xhtml")) {
-      // ainda assim, tenta ler se for vazio
-      // return null;
-    }
-    return await r.text();
+    const text = await r.text();
+    if (!text || text.length < 400) return null; // muito curto = provável bloqueio/placeholder
+    return text;
   } catch {
     return null;
   } finally {
@@ -150,14 +204,43 @@ async function safeFetchText(url, timeoutMs = 10000) {
   }
 }
 
-// ===== Crawl do site (muito mais robusto) =====
+// ===== Crawl do site (robusto) =====
 async function crawlSite(domain) {
-  const timeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || "10000");
+  const timeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || "12000");
 
-  const baseHttps = `https://${domain}`;
-  const baseHttp = `http://${domain}`;
+  // tenta https/http com e sem www
+  const candidates = [
+    `https://${domain}`,
+    `https://www.${domain}`,
+    `http://${domain}`,
+    `http://www.${domain}`,
+  ];
 
-  // caminhos comuns (BR) + variações com / no final
+  let baseUrl = candidates[0];
+  let homeHtml = null;
+
+  for (const base of candidates) {
+    const html = await safeFetchText(base + "/", timeoutMs);
+    if (html) {
+      baseUrl = base;
+      homeHtml = html;
+      break;
+    }
+  }
+
+  let combined = "";
+  const visited = new Set();
+
+  async function visit(url) {
+    if (!url || visited.has(url)) return;
+    visited.add(url);
+    const html = await safeFetchText(url, timeoutMs);
+    if (html) combined += "\n" + html;
+  }
+
+  if (homeHtml) combined += "\n" + homeHtml;
+
+  // páginas comuns (BR + ecommerce)
   const paths = [
     "/",
     "/contato",
@@ -182,46 +265,42 @@ async function crawlSite(domain) {
     "/privacidade/",
     "/politica",
     "/politica/",
+    "/faq",
+    "/faq/",
+    "/trocas-e-devolucoes",
+    "/trocas-e-devolucoes/",
+    "/politica-de-reembolso",
+    "/politica-de-reembolso/",
+    "/reembolso",
+    "/reembolso/",
+    "/envio-e-entrega",
+    "/envio-e-entrega/",
+    "/frete-e-entrega",
+    "/frete-e-entrega/",
+    "/politica-de-envio",
+    "/politica-de-envio/",
+    "/shipping",
+    "/shipping/",
+    "/refund",
+    "/refund/",
+    "/returns",
+    "/returns/",
   ];
 
-  // 1) tenta https primeiro
-  let baseUrl = baseHttps;
-  let homeHtml = await safeFetchText(baseUrl + "/", timeoutMs);
-
-  // 2) se https falhar, tenta http
-  if (!homeHtml) {
-    baseUrl = baseHttp;
-    homeHtml = await safeFetchText(baseUrl + "/", timeoutMs);
-  }
-
-  let combined = "";
-  const visited = new Set();
-
-  async function visit(url) {
-    if (!url || visited.has(url)) return;
-    visited.add(url);
-    const html = await safeFetchText(url, timeoutMs);
-    if (html) combined += "\n" + html;
-  }
-
-  // visita home
-  if (homeHtml) combined += "\n" + homeHtml;
-
-  // visita caminhos padrão
   for (const p of paths) {
     await visit(baseUrl + p);
   }
 
-  // pega links internos “úteis” na home e visita também
+  // links internos úteis encontrados na home
   if (homeHtml) {
     const extra = pickInternalLinks(baseUrl + "/", homeHtml);
     for (const u of extra) await visit(u);
   }
 
   const text = stripTags(combined);
-
   const emails = extractEmails(combined + " " + text);
   const phones = extractPhones(combined + " " + text);
+  const whatsapps = extractWhatsApps(combined + " " + text);
   const cnpj = extractCNPJ(combined + " " + text);
 
   return {
@@ -229,6 +308,7 @@ async function crawlSite(domain) {
     crawled: combined.length > 0,
     emails,
     phones,
+    whatsapps,
     cnpj,
   };
 }
@@ -259,43 +339,49 @@ async function builtwithLookup(domain) {
         }
       }
     }
+
     return { ok: true, tech: uniq(names) };
   } catch {
     return { ok: false, tech: [] };
   }
 }
 
-// ===== Classificação (para preencher os campos que você quer) =====
+// ===== Classificação (Plataforma + Automação) =====
 function classifyFromBuiltWith(techList) {
   const tech = (techList || []).map((t) => t.toLowerCase());
 
+  // Plataformas
   const platformRules = [
+    { key: "bagy", name: "Bagy" },
     { key: "shopify", name: "Shopify" },
     { key: "woocommerce", name: "WooCommerce" },
-    { key: "magento", name: "Magento" },
     { key: "vtex", name: "VTEX" },
+    { key: "magento", name: "Magento" },
     { key: "bigcommerce", name: "BigCommerce" },
     { key: "prestashop", name: "PrestaShop" },
     { key: "opencart", name: "OpenCart" },
+    { key: "nuvemshop", name: "Nuvemshop" },
+    { key: "loja integrada", name: "Loja Integrada" },
+    { key: "tray", name: "Tray" },
+    { key: "wake", name: "Wake" },
+    { key: "linx commerce", name: "Linx Commerce" },
+    { key: "oracle commerce", name: "Oracle Commerce" },
     { key: "salesforce commerce cloud", name: "Salesforce Commerce Cloud" },
     { key: "sap commerce", name: "SAP Commerce Cloud" },
-    { key: "nuvemshop", name: "Nuvemshop" },
-    { key: "tray", name: "Tray" },
-    { key: "loja integrada", name: "Loja Integrada" },
   ];
 
+  // Automação / CRM / Marketing
   const marketingRules = [
+    { key: "klaviyo", name: "Klaviyo" },
     { key: "rd station", name: "RD Station" },
     { key: "hubspot", name: "HubSpot" },
     { key: "mailchimp", name: "Mailchimp" },
-    { key: "klaviyo", name: "Klaviyo" },
     { key: "activecampaign", name: "ActiveCampaign" },
+    { key: "sendinblue", name: "Brevo (Sendinblue)" },
     { key: "salesforce marketing cloud", name: "Salesforce Marketing Cloud" },
     { key: "marketo", name: "Adobe Marketo" },
-    { key: "zendesk", name: "Zendesk" }, // suporte/CRM, às vezes útil
+    { key: "zendesk", name: "Zendesk" },
     { key: "intercom", name: "Intercom" },
-    { key: "tawk", name: "Tawk.to" },
-    { key: "hotjar", name: "Hotjar" }, // analytics (não é automação, mas ajuda; se não quiser, remova)
   ];
 
   let ecommerce_platform = null;
@@ -319,7 +405,7 @@ function classifyFromBuiltWith(techList) {
   };
 }
 
-// ===== CNPJ.biz (encaixável por variáveis) =====
+// ===== CNPJ.biz (configurável por variáveis) =====
 async function cnpjbizLookup(cnpjDigits) {
   const base = process.env.CNPJBIZ_BASE_URL;
   const key = process.env.CNPJBIZ_API_KEY;
@@ -340,7 +426,7 @@ async function cnpjbizLookup(cnpjDigits) {
     if (!r.ok) return null;
     const data = await r.json();
 
-    // Mapeamento genérico (você pode ajustar quando ver o retorno real)
+    // Mapeamento genérico (ajuste depois conforme seu retorno real)
     const partners = data?.partners || data?.socios || data?.qsa || [];
     const phones = data?.phones || data?.telefones || [];
     const emails = data?.emails || (data?.email ? [data.email] : []);
@@ -356,7 +442,7 @@ async function cnpjbizLookup(cnpjDigits) {
       phones: Array.isArray(phones) ? phones : [phones].filter(Boolean),
       emails: Array.isArray(emails) ? emails : [emails].filter(Boolean),
       city,
-      raw: data, // útil pra debug; se não quiser, remova depois
+      raw: data, // útil pra debug; remova depois se quiser
     };
   } catch {
     return null;
@@ -375,17 +461,13 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
     return res.status(400).json({ error: "Envie { domain: 'exemplo.com.br' }" });
   }
 
-  // 1) site
   const site = await crawlSite(domain);
 
-  // 2) builtwith + classificação
   const bw = await builtwithLookup(domain);
   const classified = classifyFromBuiltWith(bw.tech);
 
-  // 3) cnpjbiz (se tiver CNPJ)
   const cnpjbiz = site.cnpj ? await cnpjbizLookup(site.cnpj) : null;
 
-  // Formato final como você quer
   res.json({
     domain,
     url: site.baseUrl,
@@ -394,6 +476,7 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
     marketing_automation_tools: classified.marketing_automation_tools,
 
     phones_found_on_site: site.phones,
+    whatsapps_found_on_site: site.whatsapps,
     emails_found_on_site: site.emails,
 
     cnpj: site.cnpj,
@@ -407,11 +490,13 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
         }
       : null,
 
-    // debug opcional
+    // Debug (útil pra você entender quando algo não aparece)
     builtwith_technologies: bw.tech,
     sources: { builtwith: bw.ok, site: site.crawled, cnpjbiz: !!cnpjbiz },
     notes: [
-      site.crawled ? "Site visitado." : "Não consegui acessar o site (https e http falharam).",
+      site.crawled
+        ? "Site visitado."
+        : "Não consegui acessar o site (https/http e www falharam).",
       site.cnpj ? "CNPJ encontrado no site." : "CNPJ não encontrado no site.",
       bw.ok ? "BuiltWith consultado." : "BuiltWith não consultado (sem chave ou falha).",
       cnpjbiz ? "CNPJ.biz consultado." : "CNPJ.biz não consultado (sem CNPJ, sem config ou falha).",
