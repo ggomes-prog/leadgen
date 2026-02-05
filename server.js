@@ -3,12 +3,14 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
+// Railway injeta PORT automaticamente
 const PORT = process.env.PORT || 3000;
 
-// ========= segurança simples (senha) =========
+// ====== AUTH: Authorization: Bearer <ACTION_API_KEY> ======
 function checkAuth(req, res, next) {
   const expected = process.env.ACTION_API_KEY;
-  if (!expected) return next(); // se você não configurou, não bloqueia
+  if (!expected) return next(); // se não tiver configurado, não bloqueia (apenas pra debug)
+
   const auth = req.headers.authorization || "";
   if (auth !== `Bearer ${expected}`) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -16,7 +18,7 @@ function checkAuth(req, res, next) {
   next();
 }
 
-// ========= utilitários =========
+// ====== Helpers ======
 function normalizeDomain(input) {
   return (input || "")
     .trim()
@@ -36,7 +38,6 @@ function extractEmails(html) {
 }
 
 function extractPhones(html) {
-  // pega padrões comuns BR (não é perfeito, mas funciona bem na prática)
   const raw = html.match(/(\+?55\s?)?(\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}/g) || [];
   return uniq(raw.map(s => s.replace(/\s+/g, " ").trim()));
 }
@@ -44,7 +45,6 @@ function extractPhones(html) {
 function extractCNPJ(html) {
   const m = html.match(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g);
   if (!m || !m.length) return null;
-  // pega o primeiro e normaliza pra só dígitos
   const digits = m[0].replace(/\D/g, "");
   return digits.length === 14 ? digits : null;
 }
@@ -73,7 +73,7 @@ async function crawlSite(domain) {
     "/privacidade",
     "/termos",
     "/quem-somos",
-    "/sobre"
+    "/sobre",
   ];
 
   let allHtml = "";
@@ -86,11 +86,10 @@ async function crawlSite(domain) {
   const phones = extractPhones(allHtml);
   const cnpj = extractCNPJ(allHtml);
 
-  return { emails, phones, cnpj, baseUrl: base, crawled: allHtml.length > 0 };
+  return { baseUrl: base, crawled: allHtml.length > 0, emails, phones, cnpj };
 }
 
-// ========= BuiltWith (Domain API) =========
-// BuiltWith Domain API: https://api.builtwith.com/v20/api.json?KEY=...&LOOKUP=domain :contentReference[oaicite:0]{index=0}
+// ====== BuiltWith ======
 async function builtwithLookup(domain) {
   const key = process.env.BUILTWITH_API_KEY;
   if (!key) return { ok: false, tech: [] };
@@ -104,7 +103,6 @@ async function builtwithLookup(domain) {
     if (!r.ok) return { ok: false, tech: [] };
     const data = await r.json();
 
-    // A resposta do BuiltWith vem bem grande; aqui pegamos nomes de tecnologias se existirem.
     const techNames = [];
     const results = data?.Results || data?.results || [];
     for (const res of results) {
@@ -124,38 +122,44 @@ async function builtwithLookup(domain) {
   }
 }
 
-// ========= CNPJ.biz (depende da sua conta/endpoints) =========
-// Aqui deixo um “ponto de encaixe”.
-// Você vai configurar a URL base no Railway como CNPJBIZ_BASE_URL e a chave em CNPJBIZ_API_KEY.
+// ====== CNPJ.biz (encaixe) ======
+// IMPORTANTÍSSIMO: aqui você precisa ajustar a URL e headers conforme sua conta/doc.
+// Variáveis usadas:
+// - CNPJBIZ_BASE_URL (com https)
+// - CNPJBIZ_API_KEY
 async function cnpjbizLookup(cnpjDigits) {
-  const base = process.env.CNPJBIZ_BASE_URL; // EX: https://api.cnpj.biz (exemplo)
+  const base = process.env.CNPJBIZ_BASE_URL;
   const key = process.env.CNPJBIZ_API_KEY;
+
   if (!base || !key) return null;
 
-  // IMPORTANTE: ajuste este endpoint conforme a doc da sua conta no CNPJ.biz
+  // Ajuste o endpoint conforme a doc do CNPJ.biz que você usa:
   const url = `${base.replace(/\/$/, "")}/cnpj/${cnpjDigits}`;
 
   try {
     const r = await fetch(url, {
-      headers: { Authorization: `Bearer ${key}` }
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
     });
     if (!r.ok) return null;
+
     const data = await r.json();
 
-    // Ajuste o mapeamento conforme o formato que o CNPJ.biz te devolver.
-    // A ideia é retornar: socios, phones, emails, city
+    // Ajuste os campos conforme o retorno real do seu CNPJ.biz
     return {
       partners: data?.partners || data?.socios || [],
       phones: data?.phones || data?.telefones || [],
-      emails: data?.emails || data?.email ? [data.email] : [],
-      city: data?.city || data?.cidade || null
+      emails: data?.emails || (data?.email ? [data.email] : []),
+      city: data?.city || data?.cidade || null,
     };
   } catch {
     return null;
   }
 }
 
-// ========= rotas =========
+// ====== Rotas ======
 app.get("/health", (req, res) => {
   res.json({ ok: true, message: "Middleware online" });
 });
@@ -167,17 +171,12 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
     return res.status(400).json({ error: "Envie { domain: 'exemplo.com.br' }" });
   }
 
-  // 1) procurar dados no próprio site
   const site = await crawlSite(domain);
-
-  // 2) BuiltWith (tecnologias)
   const bw = await builtwithLookup(domain);
-
-  // 3) CNPJ.biz (se achou CNPJ)
   const cnpjbiz = site.cnpj ? await cnpjbizLookup(site.cnpj) : null;
 
-  // OBS: por enquanto eu retorno a lista de tecnologias do BuiltWith.
-  // Depois você pode classificar isso em “plataforma ecommerce” e “automação marketing”.
+  // Por enquanto deixo ecommerce_platform e marketing_automation_tools vazios.
+  // Depois a gente classifica builtwith_technologies nesses dois campos.
   return res.json({
     domain,
     url: site.baseUrl,
@@ -193,8 +192,9 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
       bw.ok
         ? "BuiltWith consultado (lista em builtwith_technologies)."
         : "BuiltWith não consultado (sem chave ou falha).",
-      site.cnpj ? "CNPJ encontrado no site." : "CNPJ não encontrado no site."
-    ]
+      site.cnpj ? "CNPJ encontrado no site." : "CNPJ não encontrado no site.",
+      cnpjbiz ? "CNPJ.biz consultado." : "CNPJ.biz não consultado (sem CNPJ, sem config ou falha).",
+    ],
   });
 });
 
