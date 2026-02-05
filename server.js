@@ -1,36 +1,24 @@
 const express = require("express");
 
+// ===== Fetch “garantido” (funciona mesmo se Node não tiver fetch) =====
+let _fetch = global.fetch;
+async function getFetch() {
+  if (_fetch) return _fetch;
+  // Fallback usando undici
+  const undici = await import("undici");
+  _fetch = undici.fetch;
+  return _fetch;
+}
+
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-/**
- * ===== Variáveis no Railway =====
- * Obrigatórias (para o Action com Bearer):
- * - ACTION_API_KEY
- *
- * BuiltWith:
- * - BUILTWITH_API_KEY
- *
- * CNPJ.biz (depende da sua conta):
- * - CNPJBIZ_BASE_URL        (com https)
- * - CNPJBIZ_API_KEY
- *
- * (opcional, se sua API do CNPJ.biz não for o padrão)
- * - CNPJBIZ_PATH_TEMPLATE   (ex: /cnpj/{cnpj} ou /v1/cnpj/{cnpj})
- * - CNPJBIZ_AUTH_HEADER     (ex: Authorization ou x-api-key)
- * - CNPJBIZ_AUTH_PREFIX     (ex: Bearer | Token | vazio)
- *
- * Opcionais:
- * - REQUEST_TIMEOUT_MS      (ex: 12000)
- * - MAX_EXTRA_LINKS         (ex: 12)
- */
-
 // ===================== AUTH =====================
 function checkAuth(req, res, next) {
   const expected = process.env.ACTION_API_KEY;
-  if (!expected) return next(); // debug: em produção, mantenha configurado
+  if (!expected) return next();
 
   const auth = req.headers.authorization || "";
   if (auth !== `Bearer ${expected}`) {
@@ -76,15 +64,15 @@ function extractEmails(text) {
   return uniq(matches.map((x) => x.toLowerCase()));
 }
 
-// -------- Telefones (melhorado) + WhatsApp como contato --------
+// -------- Telefones (melhorado) + WhatsApp --------
 function extractPhones(text) {
   const t = (text || "").replace(/\s+/g, " ");
 
-  // 1) tel: links
+  // tel: links
   const telLinks = t.match(/tel:\+?[0-9()+\-\s.]{8,}/gi) || [];
   const fromTel = telLinks.map((x) => x.replace(/^tel:/i, "").trim());
 
-  // 2) WhatsApp links (também conta como telefone de contato)
+  // WhatsApp links
   const wa = [];
   const m1 = t.match(/wa\.me\/\d{8,15}/gi) || [];
   for (const x of m1) wa.push("+" + x.split("/")[1]);
@@ -92,21 +80,22 @@ function extractPhones(text) {
   const m2 = t.match(/api\.whatsapp\.com\/send\?phone=\d{8,15}/gi) || [];
   for (const x of m2) wa.push("+" + x.split("phone=")[1]);
 
-  // 3) números “escritos” (flexível)
+  // números escritos
   const normalMatches =
     t.match(/(\+?55\s?)?(\(?\d{2}\)?\s?)?\d{4,5}[\s.\-]?\d{4}/g) || [];
 
-  // 4) 0800
+  // 0800
   const tollFree = t.match(/\b0800[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g) || [];
 
-  const raw = uniq([...fromTel, ...wa, ...normalMatches, ...tollFree].map((x) => x.trim()));
+  const raw = uniq(
+    [...fromTel, ...wa, ...normalMatches, ...tollFree].map((x) => x.trim())
+  );
 
-  // normalização simples
   const normalized = raw
     .map((s) => s.replace(/[^\d+]/g, ""))
     .map((s) => {
       const digits = s.replace(/\D/g, "");
-      if (digits.startsWith("0800")) return digits; // mantém 0800
+      if (digits.startsWith("0800")) return digits;
       if (digits.length === 10 || digits.length === 11) return `+55${digits}`;
       if (digits.length === 12 || digits.length === 13) return `+${digits}`;
       if (s.startsWith("+")) return s;
@@ -117,7 +106,7 @@ function extractPhones(text) {
   return uniq(normalized);
 }
 
-// -------- CNPJ: pega TODOS e escolhe o mais provável (rodapé/termos/privacidade) --------
+// -------- CNPJ: pega todos e escolhe o mais provável --------
 function extractCNPJs(text) {
   const m = text.match(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g) || [];
   const digits = m
@@ -134,11 +123,11 @@ function chooseBestCNPJ(htmlCombined, cnpjList) {
 
   function score(cnpjDigits) {
     const formatted = formatCNPJ(cnpjDigits);
-    const variants = uniq([cnpjDigits, formatted].filter(Boolean)).map((v) => v.toLowerCase());
+    const variants = uniq([cnpjDigits, formatted].filter(Boolean)).map((v) =>
+      v.toLowerCase()
+    );
 
     let s = 0;
-
-    // Palavras que indicam CNPJ de empresa (mais provável ser o "certo")
     const keywords = [
       "cnpj",
       "razão social",
@@ -149,8 +138,6 @@ function chooseBestCNPJ(htmlCombined, cnpjList) {
       "ltda",
       "me",
       "eireli",
-      "comércio",
-      "comercio",
       "endereço",
       "endereco",
       "contato",
@@ -161,26 +148,23 @@ function chooseBestCNPJ(htmlCombined, cnpjList) {
       "trocas",
       "devol",
       "footer",
-      "rodap", // pega "rodapé" mesmo sem acento
+      "rodap",
     ];
 
     for (const v of variants) {
       let idx = html.indexOf(v);
-      // se o site esconde pontuação, tenta achar só dígitos também
-      if (idx < 0 && v.includes(".") && v.includes("/")) {
+      if (idx < 0) {
         const vd = v.replace(/\D/g, "");
-        idx = html.indexOf(vd);
+        if (vd.length >= 10) idx = html.indexOf(vd);
       }
       if (idx >= 0) {
-        const start = Math.max(0, idx - 200);
-        const end = Math.min(html.length, idx + 200);
+        const start = Math.max(0, idx - 220);
+        const end = Math.min(html.length, idx + 220);
         const window = html.slice(start, end);
 
         for (const k of keywords) {
           if (window.includes(k)) s += 5;
         }
-
-        // bônus se estiver perto de "shopify"/"bagy"/etc no footer? (não essencial)
         if (window.includes("footer")) s += 3;
       }
     }
@@ -251,7 +235,10 @@ function pickInternalLinks(baseUrl, html) {
   return uniq(links).slice(0, maxExtra);
 }
 
-async function safeFetchText(url, timeoutMs = 12000) {
+// ===================== HTTP HELPERS com LOG =====================
+async function safeFetchText(url, timeoutMs = 15000) {
+  const fetch = await getFetch();
+
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
 
@@ -268,12 +255,73 @@ async function safeFetchText(url, timeoutMs = 12000) {
       },
     });
 
+    const text = await r.text();
+
+    if (process.env.DEBUG_FETCH === "1") {
+      console.log(
+        `[fetch] ${r.status} ${url} len=${text ? text.length : 0} ct=${r.headers?.get?.("content-type") || ""}`
+      );
+    }
+
     if (!r.ok) return null;
+    if (!text) return null;
+
+    // corte BEM suave (não derruba páginas válidas)
+    if (text.length < 40) return null;
+
+    return text;
+  } catch (e) {
+    if (process.env.DEBUG_FETCH === "1") {
+      console.log(
+        `[fetch-error] ${url} -> ${e?.name || "Error"}: ${e?.message || e}`
+      );
+    }
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function safeFetchJson(url, headers = {}, timeoutMs = 15000) {
+  const fetch = await getFetch();
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+
+  try {
+    const r = await fetch(url, {
+      redirect: "follow",
+      signal: ctrl.signal,
+      headers: {
+        ...headers,
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+        Accept: "application/json,text/plain,*/*",
+      },
+    });
 
     const text = await r.text();
-    if (!text || text.length < 400) return null;
-    return text;
-  } catch {
+
+    if (process.env.DEBUG_FETCH === "1") {
+      console.log(
+        `[fetch-json] ${r.status} ${url} len=${text ? text.length : 0}`
+      );
+    }
+
+    if (!r.ok) return null;
+    if (!text) return null;
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  } catch (e) {
+    if (process.env.DEBUG_FETCH === "1") {
+      console.log(
+        `[fetch-json-error] ${url} -> ${e?.name || "Error"}: ${e?.message || e}`
+      );
+    }
     return null;
   } finally {
     clearTimeout(t);
@@ -282,7 +330,7 @@ async function safeFetchText(url, timeoutMs = 12000) {
 
 // ===================== CRAWL SITE =====================
 async function crawlSite(domain) {
-  const timeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || "12000");
+  const timeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || "15000");
 
   const candidates = [
     `https://${domain}`,
@@ -375,7 +423,6 @@ async function crawlSite(domain) {
   const emails = extractEmails(combined + " " + text);
   const phones = extractPhones(combined + " " + text);
 
-  // CNPJ: candidatos + escolha do melhor
   const cnpjCandidates = extractCNPJs(combined + " " + text);
   const cnpj = chooseBestCNPJ(combined, cnpjCandidates);
 
@@ -398,28 +445,23 @@ async function builtwithLookup(domain) {
     key
   )}&LOOKUP=${encodeURIComponent(domain)}`;
 
-  try {
-    const r = await fetch(url);
-    if (!r.ok) return { ok: false, tech: [] };
-    const data = await r.json();
+  const data = await safeFetchJson(url, {}, 15000);
+  if (!data) return { ok: false, tech: [] };
 
-    const names = [];
-    const results = data?.Results || data?.results || [];
-    for (const res of results) {
-      const paths = res?.Result?.Paths || res?.result?.paths || [];
-      for (const p of paths) {
-        const tech = p?.Technologies || p?.technologies || [];
-        for (const t of tech) {
-          const name = t?.Name || t?.name;
-          if (name) names.push(name);
-        }
+  const names = [];
+  const results = data?.Results || data?.results || [];
+  for (const res of results) {
+    const paths = res?.Result?.Paths || res?.result?.paths || [];
+    for (const p of paths) {
+      const tech = p?.Technologies || p?.technologies || [];
+      for (const t of tech) {
+        const name = t?.Name || t?.name;
+        if (name) names.push(name);
       }
     }
-
-    return { ok: true, tech: uniq(names) };
-  } catch {
-    return { ok: false, tech: [] };
   }
+
+  return { ok: true, tech: uniq(names) };
 }
 
 // ===================== CLASSIFICAÇÃO =====================
@@ -439,10 +481,6 @@ function classifyFromBuiltWith(techList) {
     { key: "loja integrada", name: "Loja Integrada" },
     { key: "tray", name: "Tray" },
     { key: "wake", name: "Wake" },
-    { key: "linx commerce", name: "Linx Commerce" },
-    { key: "oracle commerce", name: "Oracle Commerce" },
-    { key: "salesforce commerce cloud", name: "Salesforce Commerce Cloud" },
-    { key: "sap commerce", name: "SAP Commerce Cloud" },
   ];
 
   const marketingRules = [
@@ -452,10 +490,7 @@ function classifyFromBuiltWith(techList) {
     { key: "mailchimp", name: "Mailchimp" },
     { key: "activecampaign", name: "ActiveCampaign" },
     { key: "sendinblue", name: "Brevo (Sendinblue)" },
-    { key: "salesforce marketing cloud", name: "Salesforce Marketing Cloud" },
     { key: "marketo", name: "Adobe Marketo" },
-    { key: "zendesk", name: "Zendesk" },
-    { key: "intercom", name: "Intercom" },
   ];
 
   let ecommerce_platform = null;
@@ -495,32 +530,25 @@ async function cnpjbizLookup(cnpjDigits) {
   const headers = {};
   headers[authHeader] = authPrefix ? `${authPrefix} ${key}` : key;
 
-  try {
-    const r = await fetch(url, { headers });
-    if (!r.ok) return null;
-    const data = await r.json();
+  const data = await safeFetchJson(url, headers, 15000);
+  if (!data) return null;
 
-    // Mapeamento genérico (ajuste se necessário, conforme retorno real da sua conta)
-    const partners = data?.partners || data?.socios || data?.qsa || [];
-    const phones = data?.phones || data?.telefones || [];
-    const emails = data?.emails || (data?.email ? [data.email] : []);
-    const city =
-      data?.city ||
-      data?.cidade ||
-      data?.endereco?.cidade ||
-      data?.address?.city ||
-      null;
+  const partners = data?.partners || data?.socios || data?.qsa || [];
+  const phones = data?.phones || data?.telefones || [];
+  const emails = data?.emails || (data?.email ? [data.email] : []);
+  const city =
+    data?.city ||
+    data?.cidade ||
+    data?.endereco?.cidade ||
+    data?.address?.city ||
+    null;
 
-    return {
-      partners,
-      phones: Array.isArray(phones) ? phones : [phones].filter(Boolean),
-      emails: Array.isArray(emails) ? emails : [emails].filter(Boolean),
-      city,
-      raw: data, // útil pra debug; remova depois se quiser
-    };
-  } catch {
-    return null;
-  }
+  return {
+    partners,
+    phones: Array.isArray(phones) ? phones : [phones].filter(Boolean),
+    emails: Array.isArray(emails) ? emails : [emails].filter(Boolean),
+    city,
+  };
 }
 
 // ===================== ROTAS =====================
@@ -530,7 +558,6 @@ app.get("/health", (req, res) => {
 
 app.post("/lead/inspect", checkAuth, async (req, res) => {
   const domain = normalizeDomain(req.body?.domain);
-
   if (!domain) {
     return res.status(400).json({ error: "Envie { domain: 'exemplo.com.br' }" });
   }
@@ -549,11 +576,9 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
     ecommerce_platform: classified.ecommerce_platform,
     marketing_automation_tools: classified.marketing_automation_tools,
 
-    // Telefones (inclui WhatsApp/0800/tel: quando existir)
     phones_found_on_site: site.phones,
     emails_found_on_site: site.emails,
 
-    // CNPJ escolhido + candidatos (pra você auditar)
     cnpj: site.cnpj ? formatCNPJ(site.cnpj) : null,
     cnpj_candidates: (site.cnpjCandidates || []).map(formatCNPJ).filter(Boolean),
 
@@ -566,16 +591,19 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
         }
       : null,
 
-    // Debug
     builtwith_technologies: bw.tech,
     sources: { builtwith: bw.ok, site: site.crawled, cnpjbiz: !!cnpjbiz },
     notes: [
       site.crawled
         ? "Site visitado."
         : "Não consegui acessar o site (https/http e www falharam).",
-      site.cnpj ? "CNPJ encontrado no site (melhor candidato)." : "CNPJ não encontrado no site.",
-      bw.ok ? "BuiltWith consultado." : "BuiltWith não consultado (sem chave ou falha).",
-      cnpjbiz ? "CNPJ.biz consultado." : "CNPJ.biz não consultado (sem CNPJ, sem config ou falha).",
+      site.cnpj
+        ? "CNPJ encontrado no site (melhor candidato)."
+        : "CNPJ não encontrado no site.",
+      bw.ok ? "BuiltWith consultado." : "BuiltWith falhou (ver logs com DEBUG_FETCH=1).",
+      cnpjbiz
+        ? "CNPJ.biz consultado."
+        : "CNPJ.biz não consultado (sem CNPJ ou falha).",
     ],
   });
 });
@@ -583,3 +611,15 @@ app.post("/lead/inspect", checkAuth, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+{
+  "name": "lead-middleware",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "undici": "^6.19.8"
+  }
+}
